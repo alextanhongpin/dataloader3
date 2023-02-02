@@ -9,102 +9,90 @@ import (
 	"time"
 )
 
-var (
-	ErrTimeout     = errors.New("dataloader: fetch timeout")
-	ErrKeyNotFound = errors.New("dataloader: key not found")
-)
+var ErrKeyNotFound = errors.New("dataloader: key not found")
 
 type DataLoader[K comparable, V any] struct {
-	ctx              context.Context
-	mu               sync.RWMutex
-	wg               sync.WaitGroup
-	cache            map[K]Result[V]
-	done             chan struct{}
-	ch               []chan job[K, V]
-	keyFn            keyFn[K, V]
-	batchFn          batchFn[K, V]
-	batchTimeout     time.Duration
-	batchWaitTimeout time.Duration // How long before cancelling the batchFn
-	batchMaxKeys     int
-	batchMaxWorkers  int
-	debounce         bool
+	wg              sync.WaitGroup
+	done            chan struct{}
+	cond            *sync.Cond
+	cache           map[K]Result[V]
+	ch              []chan K
+	keyFn           keyFn[K, V]
+	baseContext     func() context.Context
+	batchFn         batchFn[K, V]
+	batchInterval   time.Duration
+	batchTimeout    time.Duration
+	batchMaxKeys    int
+	batchMaxWorkers int
+	debounce        bool
 
-	once sync.Once
+	initOnce sync.Once
+	stopOnce sync.Once
 }
 
 type batchFn[K comparable, V any] func(ctx context.Context, keys []K) ([]V, error)
 
 type keyFn[K comparable, V any] func(V) K
 
-func New[K comparable, V any](
-	ctx context.Context,
-	batchFn batchFn[K, V],
-	keyFn keyFn[K, V],
-	options ...Option,
-) (*DataLoader[K, V], func()) {
+func New[K comparable, V any](batchFn batchFn[K, V], keyFn keyFn[K, V], options ...Option) (*DataLoader[K, V], func()) {
 	opt := NewDefaultOption()
 	for _, o := range options {
 		o(opt)
 	}
 
-	ch := make([]chan job[K, V], opt.BatchMaxWorkers)
-	for i := 0; i < opt.BatchMaxWorkers; i++ {
-		ch[i] = make(chan job[K, V], opt.BatchMaxWorkers)
-	}
-
 	dl := &DataLoader[K, V]{
-		ctx:              ctx,
-		ch:               ch,
-		cache:            make(map[K]Result[V]),
-		done:             make(chan struct{}),
-		keyFn:            keyFn,
-		batchFn:          batchFn,
-		batchTimeout:     opt.BatchTimeout,
-		batchWaitTimeout: opt.BatchWaitTimeout,
-		batchMaxKeys:     opt.BatchMaxKeys,
-		batchMaxWorkers:  opt.BatchMaxWorkers,
-		debounce:         opt.Debounce,
+		cache:           make(map[K]Result[V]),
+		cond:            sync.NewCond(&sync.Mutex{}),
+		done:            make(chan struct{}),
+		keyFn:           keyFn,
+		baseContext:     opt.BaseContext,
+		batchFn:         batchFn,
+		batchInterval:   opt.BatchInterval,
+		batchTimeout:    opt.BatchTimeout,
+		batchMaxKeys:    opt.BatchMaxKeys,
+		batchMaxWorkers: opt.BatchMaxWorkers,
+		debounce:        opt.Debounce,
 	}
 
-	var once sync.Once
-
-	return dl, func() {
-		once.Do(func() {
-			close(dl.done)
-			dl.wg.Wait()
-		})
-	}
+	return dl, dl.close
 }
 
 // Has checks if the key exists.
 func (dl *DataLoader[K, V]) Has(k K) bool {
-	dl.mu.RLock()
+	dl.cond.L.Lock()
 	_, ok := dl.cache[k]
-	dl.mu.RUnlock()
+	dl.cond.L.Unlock()
 
 	return ok
 }
 
 // Set overrides the existing cache value.
 func (dl *DataLoader[K, V]) Set(k K, v V) {
-	dl.mu.Lock()
+	dl.cond.L.Lock()
 	dl.cache[k] = Result[V]{Value: v}
-	dl.mu.Unlock() // Notify all the other readers that a potential result has been written.
+	dl.cond.Broadcast()
+	dl.cond.L.Unlock() // Notify all the other readers that a potential result has been written.
 }
 
 // LoadMany returns the result of the keys. Does not return error.
-func (dl *DataLoader[K, V]) LoadMany(ctx context.Context, keys []K) []V {
+func (dl *DataLoader[K, V]) LoadMany(keys []K) []V {
+	dl.init()
+
 	result := make([]Result[V], len(keys))
 
 	// Lazily preloads the data, ensuring the data is loaded in batch.
 	// This is more performant then loading them individually.
 	for _, key := range keys {
-		dl.preload(key)
+		if len(dl.ch) == 0 {
+			break
+		}
+
+		dl.ch[dl.partition(key)] <- key
 	}
 
 	values := make([]V, 0, len(result))
 	for _, key := range keys {
-		v, err := dl.Load(ctx, key)
+		v, err := dl.Load(key)
 		if err == nil {
 			values = append(values, v)
 		}
@@ -115,141 +103,121 @@ func (dl *DataLoader[K, V]) LoadMany(ctx context.Context, keys []K) []V {
 
 // Load loads a cached value by key. If the key does not exists, it will lazily
 // batch load multiple keys.
-func (dl *DataLoader[K, V]) Load(ctx context.Context, key K) (V, error) {
+func (dl *DataLoader[K, V]) Load(key K) (V, error) {
 	dl.init()
-
-	j := job[K, V]{
-		key: key,
-		ch:  make(chan Result[V]),
-	}
-
-	dl.ch[dl.partition(key)] <- j
 
 	select {
-	case <-ctx.Done():
+	case <-dl.done:
+		dl.cond.L.Lock()
+		r, ok := dl.cache[key]
+		dl.cond.L.Unlock()
+		if ok {
+			return r.Value, r.Error
+		}
+
 		var v V
-		return v, ctx.Err()
-	case <-time.After(dl.batchWaitTimeout):
-		var v V
-		return v, fmt.Errorf("%w: %v", ErrTimeout, key)
-	case r := <-j.ch:
-		close(j.ch)
-
-		return r.Value, r.Error
-	}
-}
-
-func (dl *DataLoader[K, V]) preload(key K) {
-	dl.init()
-
-	dl.ch[dl.partition(key)] <- job[K, V]{
-		key:   key,
-		async: true,
-	}
-}
-
-func (dl *DataLoader[K, V]) worker(id int, ch chan job[K, V]) {
-	t := time.NewTicker(dl.batchTimeout)
-	defer t.Stop()
-
-	todos := make([]job[K, V], 0, dl.batchMaxKeys)
-
-	flush := func() {
-		if len(todos) == 0 {
-			return
-		}
-
-		defer func() {
-			// Keep the capacity, but empty the slice.
-			todos = todos[:0]
-		}()
-
-		cache := make(map[K]bool)
-
-		keys := make([]K, 0, len(todos))
-		for _, todo := range todos {
-			if cache[todo.key] {
-				continue
-			}
-			cache[todo.key] = true
-
-			keys = append(keys, todo.key)
-		}
-
-		// Fetch only unique values.
-		values, err := dl.batchFn(dl.ctx, keys)
-		if err != nil {
-			for _, todo := range todos {
-				if todo.async {
-					continue
-				}
-
-				todo.ch <- Result[V]{Error: err}
-			}
-
-			return
-		}
-
-		resByKey := make(map[K]Result[V])
-		for _, v := range values {
-			resByKey[dl.keyFn(v)] = Result[V]{Value: v}
-		}
-
-		dl.mu.Lock()
-		defer dl.mu.Unlock()
-
-		for _, todo := range todos {
-			res, ok := resByKey[todo.key]
-			if !ok {
-				if todo.async {
-					continue
-				}
-
-				todo.ch <- Result[V]{Error: fmt.Errorf("%w: %v", ErrKeyNotFound, todo.key)}
-			} else {
-				// Only cache successful result.
-				// This allows failed result to be retried later.
-				dl.cache[todo.key] = res
-				if todo.async {
-					continue
-				}
-
-				todo.ch <- res
-			}
+		return v, fmt.Errorf("%w: %v", ErrKeyNotFound, key)
+	default:
+		if len(dl.ch) > 0 {
+			dl.ch[dl.partition(key)] <- key
 		}
 	}
 
 	for {
+		dl.cond.L.Lock()
+		r, ok := dl.cache[key]
+		if ok {
+			dl.cond.L.Unlock()
+			return r.Value, r.Error
+		}
+		dl.cond.Wait()
+		dl.cond.L.Unlock()
+	}
+}
+
+func (dl *DataLoader[K, V]) worker(id int, ch chan K) {
+	t := time.NewTicker(dl.batchInterval)
+	defer t.Stop()
+
+	keys := make(map[K]struct{})
+
+	flush := func() {
+		if len(keys) == 0 {
+			return
+		}
+
+		defer func() {
+			keys = make(map[K]struct{})
+		}()
+
+		uniqueKeys := make([]K, 0, len(keys))
+		for key := range keys {
+			uniqueKeys = append(uniqueKeys, key)
+		}
+
+		// Add timeout when fetching values.
+		ctx, cancel := context.WithTimeout(dl.baseContext(), dl.batchTimeout)
+		defer cancel()
+
+		values, err := dl.batchFn(ctx, uniqueKeys)
+		if err != nil {
+			dl.cond.L.Lock()
+			for key := range keys {
+				if _, ok := dl.cache[key]; !ok {
+					dl.cache[key] = Result[V]{Error: err}
+				}
+			}
+			dl.cond.Broadcast()
+			dl.cond.L.Unlock()
+
+			return
+		}
+
+		dl.cond.L.Lock()
+		for _, v := range values {
+			dl.cache[dl.keyFn(v)] = Result[V]{Value: v}
+		}
+
+		for key := range keys {
+			if _, ok := dl.cache[key]; !ok {
+				dl.cache[key] = Result[V]{Error: fmt.Errorf("%w: %v", ErrKeyNotFound, key)}
+			}
+		}
+
+		dl.cond.Broadcast()
+		dl.cond.L.Unlock()
+	}
+
+	for {
 		select {
-		case <-dl.ctx.Done():
-			flush()
-
-			return
 		case <-dl.done:
-			flush()
+			dl.cond.L.Lock()
+			for key := range keys {
+				if _, ok := dl.cache[key]; !ok {
+					dl.cache[key] = Result[V]{Error: fmt.Errorf("%w: %v", ErrKeyNotFound, key)}
+				}
+			}
+			dl.cond.Broadcast()
+			dl.cond.L.Unlock()
+
+			keys = make(map[K]struct{})
 
 			return
-		case res := <-ch:
-			dl.mu.RLock()
-			val, ok := dl.cache[res.key]
-			dl.mu.RUnlock()
-
-			if ok {
-				// Cache hit.
-				res.ch <- val
+		case key := <-ch:
+			if _, ok := keys[key]; ok {
 				continue
 			}
 
 			// Debounce improves batching by resetting the interval when a new
 			// unknown key is requested.
 			if dl.debounce {
-				t.Reset(dl.batchTimeout)
+				t.Reset(dl.batchInterval)
 			}
 
-			todos = append(todos, res)
+			keys[key] = struct{}{}
 
 			// Flush when the number of keys hits the threshold.
-			if len(todos) >= dl.batchMaxKeys {
+			if len(keys) >= dl.batchMaxKeys {
 				flush()
 			}
 		case <-t.C:
@@ -263,11 +231,18 @@ func (dl *DataLoader[K, V]) init() {
 	// Lazily initiate the worker, to avoid creating unnecessary goroutines.
 	// This becomes extremely prominent when multiple dataloaders are created per
 	// session, but not all are utilized.
-	dl.once.Do(func() {
-		dl.wg.Add(len(dl.ch))
+	dl.initOnce.Do(func() {
+		n := dl.batchMaxWorkers
+
+		dl.ch = make([]chan K, n)
+		for i := 0; i < n; i++ {
+			dl.ch[i] = make(chan K, n)
+		}
+
+		dl.wg.Add(n)
 
 		for i, ch := range dl.ch {
-			go func(i int, ch chan job[K, V]) {
+			go func(i int, ch chan K) {
 				defer dl.wg.Done()
 
 				dl.worker(i, ch)
@@ -287,42 +262,52 @@ func (dl *DataLoader[K, V]) partition(key K) int {
 	return partition
 }
 
+func (dl *DataLoader[K, V]) close() {
+	dl.initOnce.Do(func() {})
+	dl.stopOnce.Do(func() {
+		close(dl.done)
+		dl.wg.Wait()
+		dl.cond.Broadcast()
+	})
+}
+
 type Result[K any] struct {
 	Value K
 	Error error
 }
 
 type DataLoaderOption struct {
-	BatchTimeout     time.Duration
-	BatchWaitTimeout time.Duration // How long before cancellingthe batchFn
-	BatchMaxKeys     int
-	BatchMaxWorkers  int
-	Debounce         bool
+	BatchTimeout    time.Duration
+	BatchInterval   time.Duration
+	BatchMaxKeys    int
+	BatchMaxWorkers int
+	Debounce        bool
+	BaseContext     func() context.Context
 }
 
 func NewDefaultOption() *DataLoaderOption {
 	return &DataLoaderOption{
-		BatchTimeout:     16 * time.Millisecond,
-		BatchWaitTimeout: 5 * time.Second,
-		BatchMaxKeys:     1_000,
-		BatchMaxWorkers:  1,
-		Debounce:         true,
+		BatchTimeout:    5 * time.Second,
+		BatchInterval:   16 * time.Millisecond,
+		BatchMaxKeys:    1_000,
+		BatchMaxWorkers: 1,
+		Debounce:        true,
+		BaseContext: func() context.Context {
+			return context.Background()
+		},
 	}
 }
 
-// BatchTimeout is the duration before the batchFn is called.
+// BatchInterval is the duration before the batchFn is called.
+func BatchInterval(duration time.Duration) Option {
+	return func(o *DataLoaderOption) {
+		o.BatchInterval = duration
+	}
+}
+
 func BatchTimeout(duration time.Duration) Option {
 	return func(o *DataLoaderOption) {
 		o.BatchTimeout = duration
-	}
-}
-
-// BatchWaitTimeout is the duration to wait before invalidating the batchFn
-// call.
-// This is to prevent the batchFn from blocking forever.
-func BatchWaitTimeout(duration time.Duration) Option {
-	return func(o *DataLoaderOption) {
-		o.BatchWaitTimeout = duration
 	}
 }
 
@@ -350,10 +335,11 @@ func BatchMaxWorkers(n int) Option {
 	}
 }
 
-type Option func(o *DataLoaderOption)
-
-type job[K comparable, V any] struct {
-	key   K
-	ch    chan Result[V]
-	async bool
+// BaseContext provides a way to construct a new context when calling BatchFn.
+func BaseContext(fn func() context.Context) Option {
+	return func(o *DataLoaderOption) {
+		o.BaseContext = fn
+	}
 }
+
+type Option func(o *DataLoaderOption)
