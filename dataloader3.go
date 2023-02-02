@@ -96,35 +96,25 @@ func (dl *DataLoader[K, V]) Set(k K, v V) {
 func (dl *DataLoader[K, V]) LoadMany(ctx context.Context, keys []K) []V {
 	result := make([]Result[V], len(keys))
 
-	var wg sync.WaitGroup
-	wg.Add(len(keys))
-
-	for i, key := range keys {
-		go func(i int, key K) {
-			defer wg.Done()
-
-			v, err := dl.Load(ctx, key)
-			if err != nil {
-				result[i] = Result[V]{Error: err}
-			} else {
-				result[i] = Result[V]{Value: v}
-			}
-		}(i, key)
+	// Lazily preloads the data, ensuring the data is loaded in batch.
+	// This is more performant then loading them individually.
+	for _, key := range keys {
+		dl.preload(key)
 	}
-	wg.Wait()
 
 	values := make([]V, 0, len(result))
-	for _, v := range result {
-		if v.Error != nil {
-			continue
+	for _, key := range keys {
+		v, err := dl.Load(ctx, key)
+		if err == nil {
+			values = append(values, v)
 		}
-
-		values = append(values, v.Value)
 	}
 
 	return values
 }
 
+// Load loads a cached value by key. If the key does not exists, it will lazily
+// batch load multiple keys.
 func (dl *DataLoader[K, V]) Load(ctx context.Context, key K) (V, error) {
 	dl.init()
 
@@ -143,7 +133,18 @@ func (dl *DataLoader[K, V]) Load(ctx context.Context, key K) (V, error) {
 		var v V
 		return v, fmt.Errorf("%w: %v", ErrTimeout, key)
 	case r := <-j.ch:
+		close(j.ch)
+
 		return r.Value, r.Error
+	}
+}
+
+func (dl *DataLoader[K, V]) preload(key K) {
+	dl.init()
+
+	dl.ch[dl.partition(key)] <- job[K, V]{
+		key:   key,
+		async: true,
 	}
 }
 
@@ -179,6 +180,10 @@ func (dl *DataLoader[K, V]) worker(id int, ch chan job[K, V]) {
 		values, err := dl.batchFn(dl.ctx, keys)
 		if err != nil {
 			for _, todo := range todos {
+				if todo.async {
+					continue
+				}
+
 				todo.ch <- Result[V]{Error: err}
 			}
 
@@ -196,12 +201,20 @@ func (dl *DataLoader[K, V]) worker(id int, ch chan job[K, V]) {
 		for _, todo := range todos {
 			res, ok := resByKey[todo.key]
 			if !ok {
+				if todo.async {
+					continue
+				}
+
 				todo.ch <- Result[V]{Error: fmt.Errorf("%w: %v", ErrKeyNotFound, todo.key)}
 			} else {
 				// Only cache successful result.
 				// This allows failed result to be retried later.
-				todo.ch <- res
 				dl.cache[todo.key] = res
+				if todo.async {
+					continue
+				}
+
+				todo.ch <- res
 			}
 		}
 	}
@@ -248,6 +261,8 @@ func (dl *DataLoader[K, V]) worker(id int, ch chan job[K, V]) {
 
 func (dl *DataLoader[K, V]) init() {
 	// Lazily initiate the worker, to avoid creating unnecessary goroutines.
+	// This becomes extremely prominent when multiple dataloaders are created per
+	// session, but not all are utilized.
 	dl.once.Do(func() {
 		dl.wg.Add(len(dl.ch))
 
@@ -338,6 +353,7 @@ func BatchMaxWorkers(n int) Option {
 type Option func(o *DataLoaderOption)
 
 type job[K comparable, V any] struct {
-	key K
-	ch  chan Result[V]
+	key   K
+	ch    chan Result[V]
+	async bool
 }

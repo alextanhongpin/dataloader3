@@ -3,4 +3,4 @@ start:
 
 
 test:
-	@go test -v -race
+	@go test -v -race -cpuprofile cpu.out -memprofile mem.out
