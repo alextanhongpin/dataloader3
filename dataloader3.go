@@ -82,7 +82,7 @@ func (dl *DataLoader[K, V]) LoadMany(keys []K) []V {
 
 	// Lazily preloads the data, ensuring the data is loaded in batch.
 	// This is more performant then loading them individually.
-	dl.Preload(keys...)
+	dl.preload(keys...)
 
 	values := make([]V, 0, len(result))
 	for _, key := range keys {
@@ -97,6 +97,12 @@ func (dl *DataLoader[K, V]) LoadMany(keys []K) []V {
 
 // Preload sends the keys to batch without waiting for the result.
 func (dl *DataLoader[K, V]) Preload(keys ...K) {
+	dl.init()
+
+	dl.preload(keys...)
+}
+
+func (dl *DataLoader[K, V]) preload(keys ...K) {
 	if len(dl.ch) == 0 {
 		return
 	}
