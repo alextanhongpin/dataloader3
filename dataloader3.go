@@ -82,13 +82,7 @@ func (dl *DataLoader[K, V]) LoadMany(keys []K) []V {
 
 	// Lazily preloads the data, ensuring the data is loaded in batch.
 	// This is more performant then loading them individually.
-	for _, key := range keys {
-		if len(dl.ch) == 0 {
-			break
-		}
-
-		dl.ch[dl.partition(key)] <- key
-	}
+	dl.Preload(keys...)
 
 	values := make([]V, 0, len(result))
 	for _, key := range keys {
@@ -99,6 +93,21 @@ func (dl *DataLoader[K, V]) LoadMany(keys []K) []V {
 	}
 
 	return values
+}
+
+// Preload sends the keys to batch without waiting for the result.
+func (dl *DataLoader[K, V]) Preload(keys ...K) {
+	if len(dl.ch) == 0 {
+		return
+	}
+
+	for _, key := range keys {
+		select {
+		case <-dl.done:
+			return
+		case dl.ch[dl.partition(key)] <- key:
+		}
+	}
 }
 
 // Load loads a cached value by key. If the key does not exists, it will lazily
@@ -200,7 +209,7 @@ func (dl *DataLoader[K, V]) worker(id int, ch chan K) {
 			dl.cond.Broadcast()
 			dl.cond.L.Unlock()
 
-			keys = make(map[K]struct{})
+			keys = nil
 
 			return
 		case key := <-ch:
@@ -263,11 +272,12 @@ func (dl *DataLoader[K, V]) partition(key K) int {
 }
 
 func (dl *DataLoader[K, V]) close() {
+	// If init is not called yet, this will prevent future execution, which may
+	// be blocking.
 	dl.initOnce.Do(func() {})
 	dl.stopOnce.Do(func() {
 		close(dl.done)
 		dl.wg.Wait()
-		dl.cond.Broadcast()
 	})
 }
 
