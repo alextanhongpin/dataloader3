@@ -57,7 +57,7 @@ func New[K comparable, V any](batchFn batchFn[K, V], keyFn keyFn[K, V], options 
 	return dl, dl.close
 }
 
-// Has checks if the key exists.
+// Has checks if the key exists in the cache.
 func (dl *DataLoader[K, V]) Has(k K) bool {
 	dl.cond.L.Lock()
 	_, ok := dl.cache[k]
@@ -74,44 +74,40 @@ func (dl *DataLoader[K, V]) Set(k K, v V) {
 	dl.cond.L.Unlock() // Notify all the other readers that a potential result has been written.
 }
 
-// LoadMany returns the result of the keys. Does not return error.
-func (dl *DataLoader[K, V]) LoadMany(keys []K) []V {
+// LoadMany returns the result of the keys as well as partial errors.
+// Due to how the keys may not return result, the err can be skipped.
+func (dl *DataLoader[K, V]) LoadMany(keys []K) ([]V, error) {
 	dl.init()
 
 	// Lazily preloads the data, ensuring the data is loaded in batch.
 	// This is more performant then loading them individually.
-	dl.preload(keys...)
+	dl.send(keys...)
+
+	var keyErr *KeyError[K]
 
 	values := make([]V, 0, len(keys))
 	for _, key := range keys {
 		v, err := dl.Load(key)
-		if err == nil {
-			values = append(values, v)
+		if err != nil {
+			if keyErr == nil {
+				keyErr = NewKeyError[K]()
+			}
+			keyErr.Set(key, err)
+
+			continue
 		}
+
+		values = append(values, v)
 	}
 
-	return values
+	return values, keyErr
 }
 
 // Preload sends the keys to batch without waiting for the result.
 func (dl *DataLoader[K, V]) Preload(keys ...K) {
 	dl.init()
 
-	dl.preload(keys...)
-}
-
-func (dl *DataLoader[K, V]) preload(keys ...K) {
-	if len(dl.ch) == 0 {
-		return
-	}
-
-	for _, key := range keys {
-		select {
-		case <-dl.done:
-			return
-		case dl.ch[dl.partition(key)] <- key:
-		}
-	}
+	dl.send(keys...)
 }
 
 // Load loads a cached value by key. If the key does not exists, it will lazily
@@ -121,18 +117,12 @@ func (dl *DataLoader[K, V]) Load(key K) (V, error) {
 
 	select {
 	case <-dl.done:
-		dl.cond.L.Lock()
-		r, ok := dl.cache[key]
-		dl.cond.L.Unlock()
-		if ok {
-			return r.Value, r.Error
-		}
-
-		var v V
-		return v, fmt.Errorf("%w: %v", ErrKeyNotFound, key)
+		// If the worker is closed, the dataloader just acts as a plain key-value
+		// store.
+		return dl.get(key)
 	default:
-		if len(dl.ch) > 0 {
-			dl.ch[dl.partition(key)] <- key
+		if !dl.send(key) {
+			return dl.get(key)
 		}
 	}
 
@@ -148,10 +138,41 @@ func (dl *DataLoader[K, V]) Load(key K) (V, error) {
 	}
 }
 
+func (dl *DataLoader[K, V]) send(keys ...K) bool {
+	if len(dl.ch) == 0 {
+		return false
+	}
+
+	for _, key := range keys {
+		select {
+		case <-dl.done:
+			return false
+		case dl.ch[dl.partition(key)] <- key:
+		}
+	}
+
+	return true
+}
+
+func (dl *DataLoader[K, V]) get(key K) (V, error) {
+	dl.cond.L.Lock()
+	r, ok := dl.cache[key]
+	dl.cond.L.Unlock()
+	if ok {
+		return r.Value, r.Error
+	}
+
+	var v V
+	return v, fmt.Errorf("%w: %v", ErrKeyNotFound, key)
+}
+
 func (dl *DataLoader[K, V]) worker(id int, ch chan K) {
 	t := time.NewTicker(dl.batchInterval)
 	defer t.Stop()
 
+	// Due to the way partitioning is done, the same goroutine will always
+	// receive the same set of keys.
+	// This prevents concurrent fetch of the same key from multiple goroutines.
 	keys := make(map[K]struct{})
 
 	flush := func() {
@@ -172,14 +193,22 @@ func (dl *DataLoader[K, V]) worker(id int, ch chan K) {
 		ctx, cancel := context.WithTimeout(dl.baseContext(), dl.batchTimeout)
 		defer cancel()
 
+		// batchFn is called on the unique keys.
 		values, err := dl.batchFn(ctx, uniqueKeys)
 		if err != nil {
+			// If an error occured, mark all the keys as failed and broadcast the
+			// result to all waiting readers.
+			// This is to prevent the sync.Cond from blocking forever.
 			dl.cond.L.Lock()
 			for key := range keys {
+				// But only set to those without results, to avoid overwriting existing
+				// successful data.
 				if _, ok := dl.cache[key]; !ok {
 					dl.cache[key] = Result[V]{Error: err}
 				}
 			}
+
+			// Broadcast to all waiting readers.
 			dl.cond.Broadcast()
 			dl.cond.L.Unlock()
 
@@ -187,16 +216,21 @@ func (dl *DataLoader[K, V]) worker(id int, ch chan K) {
 		}
 
 		dl.cond.L.Lock()
+		// Update the cache with the successful result.
 		for _, v := range values {
 			dl.cache[dl.keyFn(v)] = Result[V]{Value: v}
 		}
 
+		// When the length of the keys and the values does not match, the sync.Cond
+		// might lock forever.
+		// We need to handle the keys without result by marking them as failed.
 		for key := range keys {
 			if _, ok := dl.cache[key]; !ok {
 				dl.cache[key] = Result[V]{Error: fmt.Errorf("%w: %v", ErrKeyNotFound, key)}
 			}
 		}
 
+		// Broadcast to all waiting readers.
 		dl.cond.Broadcast()
 		dl.cond.L.Unlock()
 	}
@@ -204,6 +238,7 @@ func (dl *DataLoader[K, V]) worker(id int, ch chan K) {
 	for {
 		select {
 		case <-dl.done:
+			// When the goroutine terminates, all the pending keys are failed.
 			dl.cond.L.Lock()
 			for key := range keys {
 				if _, ok := dl.cache[key]; !ok {
@@ -232,6 +267,7 @@ func (dl *DataLoader[K, V]) worker(id int, ch chan K) {
 			// Flush when the number of keys hits the threshold.
 			if len(keys) >= dl.batchMaxKeys {
 				flush()
+				// NOTE: Would resetting interval here helps?
 			}
 		case <-t.C:
 			// Flush at every interval.
@@ -240,10 +276,10 @@ func (dl *DataLoader[K, V]) worker(id int, ch chan K) {
 	}
 }
 
+// init lazily starts the worker, to avoid creating unnecessary goroutines.
+// This becomes extremely prominent when multiple dataloaders are created per
+// session, but not all are utilized.
 func (dl *DataLoader[K, V]) init() {
-	// Lazily initiate the worker, to avoid creating unnecessary goroutines.
-	// This becomes extremely prominent when multiple dataloaders are created per
-	// session, but not all are utilized.
 	dl.initOnce.Do(func() {
 		n := dl.batchMaxWorkers
 
@@ -357,3 +393,49 @@ func BaseContext(fn func() context.Context) Option {
 }
 
 type Option func(o *DataLoaderOption)
+
+type KeyError[K comparable] struct {
+	keys map[K]error
+}
+
+func NewKeyError[K comparable]() *KeyError[K] {
+	return &KeyError[K]{
+		keys: make(map[K]error),
+	}
+}
+
+func (k *KeyError[K]) Map() map[K]error {
+	res := make(map[K]error)
+	for kk, v := range k.keys {
+		res[kk] = v
+	}
+
+	return res
+}
+
+func (k *KeyError[K]) Len() int {
+	return len(k.keys)
+}
+
+func (k *KeyError[K]) Set(key K, err error) {
+	k.keys[key] = err
+}
+
+func (k *KeyError[K]) Get(key K) error {
+	err, ok := k.keys[key]
+	if ok {
+		return err
+	}
+
+	return fmt.Errorf("%w: %v", ErrKeyNotFound, key)
+}
+
+func (k *KeyError[K]) Error() string {
+	var label string
+	if len(k.keys) == 1 {
+		label = "key"
+	} else {
+		label = "keys"
+	}
+	return fmt.Sprintf("dataloader: %d %s failed", len(k.keys), label)
+}

@@ -37,7 +37,8 @@ func TestLoadMany(t *testing.T) {
 
 	keys := []int{1, 2, 3, 4, 5, 6, 7, 8, 9, 10}
 	expValues := []string{"1", "2", "3", "4", "5", "6", "7", "8", "9", "10"}
-	values := dl.LoadMany(keys)
+	values, err := dl.LoadMany(keys)
+	assert.Nil(err)
 	assert.Equal(expValues, values)
 }
 
@@ -94,7 +95,8 @@ func TestError(t *testing.T) {
 	assert.NotNil(err)
 	assert.Equal("", val)
 
-	values := dl.LoadMany([]int{1})
+	values, err := dl.LoadMany([]int{1})
+	assert.NotNil(err)
 	assert.True(len(values) == 0)
 }
 
@@ -108,7 +110,8 @@ func TestNoResult(t *testing.T) {
 	assert.NotNil(err)
 	assert.Equal("", val)
 
-	values := dl.LoadMany([]int{1})
+	values, err := dl.LoadMany([]int{1})
+	assert.NotNil(err)
 	assert.True(len(values) == 0)
 }
 
@@ -121,7 +124,8 @@ func TestTimeoutNoResult(t *testing.T) {
 	assert.NotNil(err)
 	assert.Equal("", val)
 
-	values := dl.LoadMany([]int{1})
+	values, err := dl.LoadMany([]int{1})
+	assert.NotNil(err)
 	assert.True(len(values) == 0)
 }
 
@@ -139,7 +143,8 @@ func TestTimeoutResult(t *testing.T) {
 	assert.NotNil(err)
 	assert.Equal("", val)
 
-	values := dl.LoadMany([]int{1})
+	values, err := dl.LoadMany([]int{1})
+	assert.NotNil(err)
 	assert.True(len(values) == 0)
 }
 
@@ -149,11 +154,14 @@ func TestCancel(t *testing.T) {
 	dl, flush := dataloader3.New(batchFnTimeout, keyFn)
 	flush()
 
+	dl.Preload(1)
+
 	val, err := dl.Load(1)
 	assert.NotNil(err)
 	assert.Equal("", val)
 
-	values := dl.LoadMany([]int{1})
+	values, err := dl.LoadMany([]int{1})
+	assert.NotNil(err)
 	assert.True(len(values) == 0)
 }
 
@@ -167,7 +175,8 @@ func TestContextCancel(t *testing.T) {
 	assert.Nil(err)
 	assert.Equal("1", val)
 
-	values := dl.LoadMany([]int{1})
+	values, err := dl.LoadMany([]int{1})
+	assert.Nil(err)
 	assert.True(len(values) == 1)
 }
 
@@ -177,7 +186,8 @@ func TestMaxBatchKeys(t *testing.T) {
 	dl, flush := dataloader3.New(batchFn, keyFn, dataloader3.BatchMaxKeys(2))
 	defer flush()
 
-	values := dl.LoadMany([]int{1, 2, 3})
+	values, err := dl.LoadMany([]int{1, 2, 3})
+	assert.Nil(err)
 	assert.Equal([]string{"1", "2", "3"}, values)
 }
 
@@ -196,13 +206,35 @@ func TestOptions(t *testing.T) {
 	dl, flush := dataloader3.New(batchFn, keyFn, options...)
 	defer flush()
 
-	values := dl.LoadMany([]int{1, 2, 3})
+	values, err := dl.LoadMany([]int{1, 2, 3})
+	assert.Nil(err)
 	assert.Equal([]string{"1", "2", "3"}, values)
 
 	// Should return the cached data even after flushed.
 	flush()
-	values = dl.LoadMany([]int{1, 2, 3})
+	values, err = dl.LoadMany([]int{1, 2, 3})
+	assert.Nil(err)
 	assert.Equal([]string{"1", "2", "3"}, values)
+}
+
+func TestKeyError(t *testing.T) {
+	keyErr := dataloader3.NewKeyError[string]()
+	keyErr.Set("hello", errors.New("hello"))
+	keyErr.Set("world", errors.New("world"))
+
+	assert := assert.New(t)
+	assert.Equal("dataloader: 2 keys failed", keyErr.Error())
+
+	var err error
+	err = keyErr
+
+	var target *dataloader3.KeyError[string]
+	assert.True(errors.As(err, &target))
+	assert.NotNil(target.Get("hello"))
+	assert.NotNil(target.Get("world"))
+	assert.True(errors.Is(target.Get("unknown"), dataloader3.ErrKeyNotFound))
+	assert.Equal(2, target.Len())
+	assert.NotNil(target.Map())
 }
 
 func batchFn(ctx context.Context, keys []int) ([]string, error) {
