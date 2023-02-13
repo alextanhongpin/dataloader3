@@ -78,13 +78,11 @@ func (dl *DataLoader[K, V]) Set(k K, v V) {
 func (dl *DataLoader[K, V]) LoadMany(keys []K) []V {
 	dl.init()
 
-	result := make([]Result[V], len(keys))
-
 	// Lazily preloads the data, ensuring the data is loaded in batch.
 	// This is more performant then loading them individually.
 	dl.preload(keys...)
 
-	values := make([]V, 0, len(result))
+	values := make([]V, 0, len(keys))
 	for _, key := range keys {
 		v, err := dl.Load(key)
 		if err == nil {
