@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"math/rand"
-	"strconv"
 	"sync"
 	"testing"
 	"time"
@@ -17,7 +16,7 @@ import (
 func TestLoad(t *testing.T) {
 	assert := assert.New(t)
 
-	dl, flush := dataloader3.New(batchFn, keyFn)
+	dl, flush := dataloader3.New(batchFn)
 	defer flush()
 
 	assert.True(!dl.Has(1))
@@ -29,10 +28,40 @@ func TestLoad(t *testing.T) {
 	assert.True(dl.Has(1))
 }
 
+func TestLoadResultMany(t *testing.T) {
+	assert := assert.New(t)
+
+	batchFn := func(ctx context.Context, ids []int) (map[int][]int, error) {
+		res := make([][]int, len(ids))
+		for i, id := range ids {
+			val := make([]int, id)
+			for j := 0; j < id; j++ {
+				val[j] = j
+			}
+			res[i] = val
+		}
+
+		return dataloader3.GroupBy(res, func(val []int) int {
+			return len(val)
+		}), nil
+	}
+
+	dl, flush := dataloader3.New(batchFn)
+	defer flush()
+
+	assert.True(!dl.Has(3))
+
+	val, err := dl.Load(3)
+	assert.Nil(err)
+	assert.Equal([]int{0, 1, 2}, val)
+
+	assert.True(dl.Has(3))
+}
+
 func TestLoadMany(t *testing.T) {
 	assert := assert.New(t)
 
-	dl, flush := dataloader3.New(batchFn, keyFn)
+	dl, flush := dataloader3.New(batchFn)
 	defer flush()
 
 	keys := []int{1, 2, 3, 4, 5, 6, 7, 8, 9, 10}
@@ -45,7 +74,7 @@ func TestLoadMany(t *testing.T) {
 func TestConcurrent(t *testing.T) {
 	assert := assert.New(t)
 
-	dl, flush := dataloader3.New(batchFn, keyFn)
+	dl, flush := dataloader3.New(batchFn)
 	defer flush()
 
 	n := 1_000
@@ -72,7 +101,7 @@ func TestConcurrent(t *testing.T) {
 func TestStruct(t *testing.T) {
 	assert := assert.New(t)
 
-	dl, flush := dataloader3.New(userBatchFn, userKeyFn)
+	dl, flush := dataloader3.New(userBatchFn)
 	defer flush()
 
 	val, err := dl.Load("1")
@@ -88,7 +117,7 @@ func TestStruct(t *testing.T) {
 func TestError(t *testing.T) {
 	assert := assert.New(t)
 
-	dl, flush := dataloader3.New(batchFnError, keyFn)
+	dl, flush := dataloader3.New(batchFnError)
 	defer flush()
 
 	val, err := dl.Load(1)
@@ -103,7 +132,7 @@ func TestError(t *testing.T) {
 func TestNoResult(t *testing.T) {
 	assert := assert.New(t)
 
-	dl, flush := dataloader3.New(batchFnNoResult, keyFn)
+	dl, flush := dataloader3.New(batchFnNoResult)
 	defer flush()
 
 	val, err := dl.Load(1)
@@ -117,7 +146,7 @@ func TestNoResult(t *testing.T) {
 
 func TestTimeoutNoResult(t *testing.T) {
 	assert := assert.New(t)
-	dl, flush := dataloader3.New(batchFnTimeout, keyFn, dataloader3.BatchTimeout(20*time.Millisecond))
+	dl, flush := dataloader3.New(batchFnTimeout, dataloader3.BatchTimeout(20*time.Millisecond))
 	defer flush()
 
 	val, err := dl.Load(1)
@@ -133,7 +162,7 @@ func TestTimeoutResult(t *testing.T) {
 	assert := assert.New(t)
 
 	ctx := context.Background()
-	dl, flush := dataloader3.New(batchFnTimeout, keyFn, dataloader3.BatchTimeout(20*time.Millisecond))
+	dl, flush := dataloader3.New(batchFnTimeout, dataloader3.BatchTimeout(20*time.Millisecond))
 	defer flush()
 
 	ctx, cancel := context.WithTimeout(ctx, 20*time.Millisecond)
@@ -151,7 +180,7 @@ func TestTimeoutResult(t *testing.T) {
 func TestCancel(t *testing.T) {
 	assert := assert.New(t)
 
-	dl, flush := dataloader3.New(batchFnTimeout, keyFn)
+	dl, flush := dataloader3.New(batchFnTimeout)
 	flush()
 
 	dl.Preload(1)
@@ -168,7 +197,7 @@ func TestCancel(t *testing.T) {
 func TestContextCancel(t *testing.T) {
 	assert := assert.New(t)
 
-	dl, flush := dataloader3.New(batchFnTimeout, keyFn)
+	dl, flush := dataloader3.New(batchFnTimeout)
 	defer flush()
 
 	val, err := dl.Load(1)
@@ -183,7 +212,7 @@ func TestContextCancel(t *testing.T) {
 func TestMaxBatchKeys(t *testing.T) {
 	assert := assert.New(t)
 
-	dl, flush := dataloader3.New(batchFn, keyFn, dataloader3.BatchMaxKeys(2))
+	dl, flush := dataloader3.New(batchFn, dataloader3.BatchMaxKeys(2))
 	defer flush()
 
 	values, err := dl.LoadMany([]int{1, 2, 3})
@@ -203,7 +232,7 @@ func TestOptions(t *testing.T) {
 			return context.Background()
 		}),
 	}
-	dl, flush := dataloader3.New(batchFn, keyFn, options...)
+	dl, flush := dataloader3.New(batchFn, options...)
 	defer flush()
 
 	values, err := dl.LoadMany([]int{1, 2, 3})
@@ -220,9 +249,12 @@ func TestOptions(t *testing.T) {
 func TestKeyError(t *testing.T) {
 	keyErr := dataloader3.NewKeyError[string]()
 	keyErr.Set("hello", errors.New("hello"))
-	keyErr.Set("world", errors.New("world"))
 
 	assert := assert.New(t)
+
+	assert.Equal("dataloader: 1 key failed", keyErr.Error())
+	keyErr.Set("world", errors.New("world"))
+
 	assert.Equal("dataloader: 2 keys failed", keyErr.Error())
 
 	var err error
@@ -237,59 +269,41 @@ func TestKeyError(t *testing.T) {
 	assert.NotNil(target.Map())
 }
 
-func batchFn(ctx context.Context, keys []int) ([]string, error) {
-	result := make([]string, len(keys))
-	for i, k := range keys {
-		result[i] = fmt.Sprint(k)
+func batchFn(ctx context.Context, keys []int) (map[int]string, error) {
+	result := make(map[int]string)
+	for _, k := range keys {
+		result[k] = fmt.Sprint(k)
 	}
 
 	return result, nil
 }
 
-func batchFnError(ctx context.Context, keys []int) ([]string, error) {
+func batchFnError(ctx context.Context, keys []int) (map[int]string, error) {
 	return nil, errors.New("bad error")
 }
 
-func batchFnNoResult(ctx context.Context, keys []int) ([]string, error) {
+func batchFnNoResult(ctx context.Context, keys []int) (map[int]string, error) {
 	return nil, nil
 }
 
-func batchFnTimeout(ctx context.Context, keys []int) ([]string, error) {
+func batchFnTimeout(ctx context.Context, keys []int) (map[int]string, error) {
 	select {
 	case <-time.After(200 * time.Millisecond):
-		result := make([]string, len(keys))
-		for i, k := range keys {
-			result[i] = fmt.Sprint(k)
-		}
-		return result, nil
+		return batchFn(ctx, keys)
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	}
-}
-
-func keyFn(val string) (key int) {
-	var err error
-	key, err = strconv.Atoi(val)
-	if err != nil {
-		panic(err)
-	}
-
-	return
 }
 
 type user struct {
 	id string
 }
 
-func userBatchFn(ctx context.Context, keys []string) ([]user, error) {
-	result := make([]user, len(keys))
-	for i, k := range keys {
-		result[i] = user{id: k}
+func userBatchFn(ctx context.Context, keys []string) (map[string]user, error) {
+	result := make(map[string]user)
+	for _, k := range keys {
+		result[k] = user{id: k}
 	}
 
 	return result, nil
-}
-
-func userKeyFn(u user) (key string) {
-	return u.id
 }

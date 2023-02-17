@@ -17,7 +17,6 @@ type DataLoader[K comparable, V any] struct {
 	cond            *sync.Cond
 	cache           map[K]Result[V]
 	ch              []chan K
-	keyFn           keyFn[K, V]
 	baseContext     func() context.Context
 	batchFn         batchFn[K, V]
 	batchInterval   time.Duration
@@ -30,11 +29,9 @@ type DataLoader[K comparable, V any] struct {
 	stopOnce sync.Once
 }
 
-type batchFn[K comparable, V any] func(ctx context.Context, keys []K) ([]V, error)
+type batchFn[K comparable, V any] func(ctx context.Context, keys []K) (map[K]V, error)
 
-type keyFn[K comparable, V any] func(V) K
-
-func New[K comparable, V any](batchFn batchFn[K, V], keyFn keyFn[K, V], options ...Option) (*DataLoader[K, V], func()) {
+func New[K comparable, V any](batchFn batchFn[K, V], options ...Option) (*DataLoader[K, V], func()) {
 	opt := NewDefaultOption()
 	for _, o := range options {
 		o(opt)
@@ -44,7 +41,6 @@ func New[K comparable, V any](batchFn batchFn[K, V], keyFn keyFn[K, V], options 
 		cache:           make(map[K]Result[V]),
 		cond:            sync.NewCond(&sync.Mutex{}),
 		done:            make(chan struct{}),
-		keyFn:           keyFn,
 		baseContext:     opt.BaseContext,
 		batchFn:         batchFn,
 		batchInterval:   opt.BatchInterval,
@@ -131,7 +127,7 @@ func (dl *DataLoader[K, V]) Load(key K) (V, error) {
 		r, ok := dl.cache[key]
 		if ok {
 			dl.cond.L.Unlock()
-			return r.Value, r.Error
+			return r.Unwrap()
 		}
 		dl.cond.Wait()
 		dl.cond.L.Unlock()
@@ -159,7 +155,7 @@ func (dl *DataLoader[K, V]) get(key K) (V, error) {
 	r, ok := dl.cache[key]
 	dl.cond.L.Unlock()
 	if ok {
-		return r.Value, r.Error
+		return r.Unwrap()
 	}
 
 	var v V
@@ -194,7 +190,7 @@ func (dl *DataLoader[K, V]) worker(id int, ch chan K) {
 		defer cancel()
 
 		// batchFn is called on the unique keys.
-		values, err := dl.batchFn(ctx, uniqueKeys)
+		valueByKey, err := dl.batchFn(ctx, uniqueKeys)
 		if err != nil {
 			// If an error occured, mark all the keys as failed and broadcast the
 			// result to all waiting readers.
@@ -216,17 +212,19 @@ func (dl *DataLoader[K, V]) worker(id int, ch chan K) {
 		}
 
 		dl.cond.L.Lock()
-		// Update the cache with the successful result.
-		for _, v := range values {
-			dl.cache[dl.keyFn(v)] = Result[V]{Value: v}
-		}
 
 		// When the length of the keys and the values does not match, the sync.Cond
 		// might lock forever.
 		// We need to handle the keys without result by marking them as failed.
-		for key := range keys {
-			if _, ok := dl.cache[key]; !ok {
-				dl.cache[key] = Result[V]{Error: fmt.Errorf("%w: %v", ErrKeyNotFound, key)}
+		for k := range keys {
+			v, ok := valueByKey[k]
+			if ok {
+				dl.cache[k] = Result[V]{Value: v}
+				continue
+			}
+
+			if _, ok := dl.cache[k]; !ok {
+				dl.cache[k] = Result[V]{Error: fmt.Errorf("%w: %v", ErrKeyNotFound, k)}
 			}
 		}
 
@@ -324,6 +322,10 @@ func (dl *DataLoader[K, V]) close() {
 type Result[K any] struct {
 	Value K
 	Error error
+}
+
+func (r *Result[K]) Unwrap() (K, error) {
+	return r.Value, r.Error
 }
 
 type DataLoaderOption struct {
@@ -438,4 +440,14 @@ func (k *KeyError[K]) Error() string {
 		label = "keys"
 	}
 	return fmt.Sprintf("dataloader: %d %s failed", len(k.keys), label)
+}
+
+func GroupBy[K comparable, V any](vs []V, fn func(V) K) map[K]V {
+	m := make(map[K]V)
+
+	for i := 0; i < len(vs); i++ {
+		m[fn(vs[i])] = vs[i]
+	}
+
+	return m
 }
