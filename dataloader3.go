@@ -451,3 +451,13 @@ func GroupBy[K comparable, V any](vs []V, fn func(V) K) map[K]V {
 
 	return m
 }
+
+func GroupByIndex[K comparable, V any](vs []V, fn func(int) K) map[K]V {
+	m := make(map[K]V)
+
+	for i := 0; i < len(vs); i++ {
+		m[fn(i)] = vs[i]
+	}
+
+	return m
+}
