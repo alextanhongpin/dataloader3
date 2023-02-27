@@ -111,15 +111,8 @@ func (dl *DataLoader[K, V]) Preload(keys ...K) {
 func (dl *DataLoader[K, V]) Load(key K) (V, error) {
 	dl.init()
 
-	select {
-	case <-dl.done:
-		// If the worker is closed, the dataloader just acts as a plain key-value
-		// store.
+	if !dl.send(key) {
 		return dl.get(key)
-	default:
-		if !dl.send(key) {
-			return dl.get(key)
-		}
 	}
 
 	for {
